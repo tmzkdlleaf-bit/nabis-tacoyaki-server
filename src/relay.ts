@@ -205,6 +205,29 @@ function presenceHeadshot(
 }
 
 /**
+ * 비밀 메시지(비밀 굴림·비밀 발화) 수신 대상 개인 룸 — 보낸 사람 + 그 방의 모든 GM.
+ * rooms.canSeeMessage(히스토리 열람 규칙)와 같은 집합이어야 한다 — 어긋나면 재입장 뒤에야 보이는 메시지가 생긴다.
+ */
+function secretTargets(room: Room, senderId: string): string[] {
+  const targets = new Set<string>(['user:' + senderId])
+  for (const p of room.participants.values()) if (p.role === 'GM') targets.add('user:' + p.playerId)
+  return [...targets]
+}
+
+/**
+ * 이 메시지의 전달 대상 — 비공개(귓속말·비밀)면 당사자들의 개인 룸, 공개면 방 전체(roomId).
+ * 수정·삭제 브로드캐스트가 원문과 같은 사람에게만 가도록 발화 시점의 라우팅을 그대로 재현한다.
+ */
+function messageAudience(room: Room, m: { playerId?: string; to?: string; channel: string; secret?: boolean }): string[] {
+  if (m.secret) return secretTargets(room, m.playerId ?? '')
+  if (m.channel === 'whisper') {
+    const ids = [m.playerId, m.to].filter((v): v is string => !!v)
+    return ids.map((id) => 'user:' + id)
+  }
+  return [room.id]
+}
+
+/**
  * opts.auth 미주입 시 비영속 인메모리 스토어(테스트 안전). 운영은 index.ts 에서 영속 스토어 주입.
  * corsOrigins: null/미설정=전체 허용(*, 개발/로컬). 배열=화이트리스트(공개 배포). Origin 헤더 없음
  *   (Electron file://·네이티브)은 항상 허용. tls 제공 시 https(wss) 서버, 없으면 http(ws).
@@ -771,6 +794,17 @@ export function createRelay(opts?: {
         const password = typeof body.password === 'string' ? body.password : ''
         const result =
           req.url === '/auth/signup' ? auth.signup(username, password) : auth.login(username, password)
+        // 새로 가입한 사람은 손님이라 승인 전에는 세션을 열 수 없다. 관리자에게 알려 승인이 밀리지 않게 한다
+        // (첫 가입자는 자기 자신이 관리자가 되므로 notif.push 의 자기알림 차단에 걸려 no-op).
+        if (req.url === '/auth/signup' && result.ok) {
+          const who = result.account
+          for (const adminId of auth.adminIds())
+            notify(adminId, {
+              kind: 'signup',
+              actor: { id: who.id, name: who.nickname || who.username },
+              text: '가입했어요'
+            })
+        }
         res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
         res.end(JSON.stringify(result))
       })
@@ -792,6 +826,52 @@ export function createRelay(opts?: {
             !isGuest && body.profileTheme !== undefined ? (body.profileTheme as ProfileTheme) : undefined // updateProfile 가 sanitizeTheme 로 재검증
         })
         res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 비밀번호 변경(본인) — 토큰 + 현재 비밀번호 재확인. 성공 시 이 세션만 남고 다른 기기 세션은 끊긴다.
+    if (req.method === 'POST' && req.url === '/auth/password') {
+      void readJsonBody(req).then((body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const current = typeof body.current === 'string' ? body.current : ''
+        const next = typeof body.next === 'string' ? body.next : ''
+        const result = auth.changePassword(token, current, next)
+        if (result.ok) {
+          // 끊긴 세션으로 붙어 있던 소켓은 살아 있어도 토큰이 무효다 — 즉시 끊어 재로그인시킨다.
+          for (const s of io.sockets.sockets.values()) {
+            const hs = s.handshake.auth as { token?: unknown }
+            if (s.data.account?.id === result.accountId && hs?.token !== token) s.disconnect(true)
+          }
+        }
+        res.writeHead(result.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 관리자 이양 — 지금 관리자가 다른 계정에 관리자를 넘기고 본인은 멤버가 된다(관리자는 항상 1명).
+    if (req.method === 'POST' && req.url === '/admin/transfer') {
+      void readJsonBody(req).then((body) => {
+        const me = requireAdmin(body, res)
+        if (!me) return
+        const userId = typeof body.userId === 'string' ? body.userId : ''
+        const result = auth.transferAdmin(me.id, userId)
+        if (!result.ok) {
+          res.writeHead(400, JSON_H)
+          res.end(JSON.stringify(result))
+          return
+        }
+        // 양쪽 접속 세션에 새 등급을 즉시 반영(재로그인 없이 관리 화면이 열리고 닫히도록).
+        for (const s of io.sockets.sockets.values()) {
+          if (s.data.account?.id === result.to.id) {
+            s.data.account.role = 'admin'
+            s.emit('role:changed', { role: 'admin' })
+          } else if (s.data.account?.id === result.from.id) {
+            s.data.account.role = 'member'
+            s.emit('role:changed', { role: 'member' })
+          }
+        }
+        res.writeHead(200, JSON_H)
         res.end(JSON.stringify(result))
       })
       return
@@ -906,10 +986,44 @@ export function createRelay(opts?: {
         }
         // 보내는 기기가 아는 '그림 참조 수' — 0 이면 정말 그림이 없는 로비, 없으면 알 수 없음(옛 프로그램).
         const refCount = typeof body.imageIds === 'number' ? body.imageIds : undefined
-        const result = auth.setLobby(token, body.lobby, refCount)
+        // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀는가 — 빈 로비로 덮는 것은 이때만 허용한다.
+        const explicitEmpty = body.explicitEmpty === true
+        const result = auth.setLobby(token, body.lobby, refCount, explicitEmpty)
         res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
         res.end(JSON.stringify(result))
       })
+      return
+    }
+    // 내 로비 음악 보관함 저장 — 토큰 인증. 오디오를 담아 본문이 크므로 /lobby 와 같은 한도로 읽는다.
+    if (req.method === 'POST' && req.url === '/lobby/music') {
+      void readRawBody(req, 48 * 1024 * 1024).then((buf) => {
+        if (!buf || buf.length === 0) {
+          res.writeHead(413, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '음악 목록이 비었거나 너무 큽니다.' }))
+          return
+        }
+        let body: Record<string, unknown> = {}
+        try {
+          const parsed = JSON.parse(buf.toString('utf8'))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as Record<string, unknown>
+        } catch {
+          body = {}
+        }
+        const token = typeof body.token === 'string' ? body.token : ''
+        // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀는가 — 보관함을 비우는 것은 이때만 허용한다.
+        const result = auth.setLobbyMusic(token, body.tracks, { explicitEmpty: body.explicitEmpty === true })
+        res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(result))
+      })
+      return
+    }
+    // 내 로비 음악 보관함 조회 — 본인만(Authorization: Bearer). 토큰을 주소에 싣지 않는다.
+    if (req.method === 'GET' && req.url === '/lobby/music') {
+      const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+      const token = authz.startsWith('Bearer ') ? authz.slice(7) : ''
+      const tracks = auth.getLobbyMusic(token)
+      res.writeHead(tracks ? 200 : 401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(tracks ? { ok: true, tracks } : { ok: false, error: '로그인이 필요합니다.' }))
       return
     }
     // 타인/내 로비 열람 — 공개 스냅샷. GET /lobby?id=<userId>.
@@ -1772,6 +1886,7 @@ export function createRelay(opts?: {
         posts.collectAssetRefs(globalLive)
         sessionlogs.collectAssetRefs(globalLive)
         dottown.collectAssetRefs(globalLive) // /admin/gc 와 동일 라이브셋(방명록 authorAvatar 등)
+        economy.collectAssetRefs(globalLive) // /admin/gc·주기 GC 와 목록을 맞춘다(빠져 있으면 표시와 실제가 갈린다)
         market.collectAssetRefs(globalLive) // ⚠UGC 마켓: 등록/보유 아이템 이미지(안 실으면 1시간 후 회수)
         community.collectAssetRefs(globalLive)
         cmtyPosts.collectAssetRefs(globalLive)
@@ -1782,13 +1897,18 @@ export function createRelay(opts?: {
         const liveSizes = assets.sizesOf(globalLive)
         let liveBytes = 0
         for (const h of globalLive) liveBytes += liveSizes.get(h) ?? 0
+        // '회수 가능'은 실제 청소가 지울 것과 같은 코드로 센다(dry-run). 예전에는 단순 뺄셈이라
+        // 유예 중인 파일까지 회수 가능으로 보여, 눌러도 0 이 나오는 일이 반복됐다.
+        const orphan = assets.orphanStats(globalLive)
         const summary = {
           accountCount: accountsList.length,
           roomCount: store.roomCount,
           assetCount: total.count,
           assetBytes: total.bytes,
           liveAssetBytes: liveBytes,
-          orphanBytes: Math.max(0, total.bytes - liveBytes)
+          orphanBytes: orphan.freed,
+          /** 미참조지만 아직 유예 중이라 지금은 못 지우는 양(잠시 뒤면 회수된다). */
+          deferredBytes: orphan.deferredBytes
         }
         res.writeHead(200, JSON_H)
         // 저장이 말썽인 방은 반드시 눈에 띄어야 한다 — 그대로 두면 재시작하는 순간 그 사이 대화가 사라진다.
@@ -2013,9 +2133,9 @@ export function createRelay(opts?: {
         cmtyCatalog.collectAssetRefs(live)
         cmtyGifts.collectAssetRefs(live)
         cmtyGames.collectAssetRefs(live)
-        const { removed, freed } = assets.sweep(live)
+        const { removed, freed, deferred, deferredBytes, failed } = assets.sweep(live)
         res.writeHead(200, JSON_H)
-        res.end(JSON.stringify({ ok: true, removed, freed }))
+        res.end(JSON.stringify({ ok: true, removed, freed, deferred, deferredBytes, failed }))
       })
       return
     }
@@ -3444,20 +3564,20 @@ export function createRelay(opts?: {
             text: resolveInlineRolls(raw.trim())
           }
 
-      // ── 대상 필터링: 개인 룸(user:playerId)으로 라우팅. 비공개는 히스토리 미저장. ──
+      // ── 대상 필터링: 개인 룸(user:playerId)으로 라우팅. 히스토리에는 저장하되(재입장 보존)
+      //    내보낼 때 뷰어별로 걸러(store.snapshot) 제3자에게는 실리지 않는다. ──
       if (secret) {
         // 비밀 굴림/메시지: GM + 본인에게만.
         message.secret = true
-        const gm = [...room.participants.values()].find((p) => p.role === 'GM')
-        const targets = new Set<string>(['user:' + playerId])
-        if (gm) targets.add('user:' + gm.playerId)
-        io.to([...targets]).emit('chat:new', message)
+        store.addMessage(roomId, message)
+        io.to(secretTargets(room, playerId)).emit('chat:new', message)
         return
       }
       if (channel === 'whisper' && typeof req.to === 'string' && req.to) {
         // 귓속말: 발신자 + 대상에게만(방 안의 대상만).
         if (!room.participants.has(req.to)) return
         message.to = req.to
+        store.addMessage(roomId, message)
         io.to(['user:' + playerId, 'user:' + req.to]).emit('chat:new', message)
         return
       }
@@ -3530,18 +3650,17 @@ export function createRelay(opts?: {
         ? { id, time, channel, author, playerId, color, avatar, nameColor, kind: 'dice', dice }
         : { id, time, channel, author, playerId, color, avatar, nameColor, kind: 'madness', madness }
 
-      // 라우팅(chat:send 와 동일): 비밀=GM+본인, 귓속말=대상+본인, 그 외 공개=히스토리+방 전체.
+      // 라우팅(chat:send 와 동일): 비밀=GM+본인, 귓속말=대상+본인, 그 외 공개=방 전체. 전부 히스토리 저장.
       if (secret) {
         message.secret = true
-        const gm = [...room.participants.values()].find((p) => p.role === 'GM')
-        const targets = new Set<string>(['user:' + playerId])
-        if (gm) targets.add('user:' + gm.playerId)
-        io.to([...targets]).emit('chat:new', message)
+        store.addMessage(roomId, message)
+        io.to(secretTargets(room, playerId)).emit('chat:new', message)
         return
       }
       if (channel === 'whisper' && typeof req.to === 'string' && req.to) {
         if (!room.participants.has(req.to)) return
         message.to = req.to
+        store.addMessage(roomId, message)
         io.to(['user:' + playerId, 'user:' + req.to]).emit('chat:new', message)
         return
       }
@@ -3598,6 +3717,50 @@ export function createRelay(opts?: {
       io.to(roomId).emit('chat:new', message)
     })
 
+    // ===== 상태 수치 변화 기록 — 시트에서 체력·정신력·이성이 바뀌면 방 기록에 한 줄. =====
+    // 행운 전환(chat:luck)과 같은 모양: 발신자 정체성은 서버가 스탬프(위조 방지), 값은 클라가 알려 준다.
+    socket.on('chat:stat', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.label !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const sender = room.participants.get(playerId)
+      if (!sender) return // 방 밖 소켓 무시
+      const num = (v: unknown): number | null =>
+        typeof v === 'number' && Number.isFinite(v) ? Math.max(-1_000_000, Math.min(1_000_000, Math.floor(v))) : null
+      const from = num(req.from)
+      const to = num(req.to)
+      if (from === null || to === null || from === to) return // 변화가 없으면 남기지 않는다
+      const max = num(req.max)
+      // 라벨은 '이름 · 항목' 형태로 온다. 짧게 자르면 뒤에 붙은 '체력/정신력/이성'이 통째로 날아가
+      // 무슨 수치가 변한 건지 사라지므로, 이름이 긴 경우까지 담을 만큼 넉넉히 둔다.
+      const label = req.label.trim().slice(0, 60)
+      if (!label) return
+      const identity = room.characters.get(playerId)
+      const diff = to - from
+      const message: ChatMessage = {
+        id: randomUUID(),
+        time: Date.now(),
+        channel: req.channel === 'ooc' ? 'ooc' : 'main',
+        kind: 'stat',
+        author: identity?.name || sender.nick,
+        playerId,
+        color: identity?.color || sender.color,
+        avatar: presenceHeadshot(identity),
+        nameColor: identity?.nameColor,
+        stat: { label, from, to, max: max !== null && max > 0 ? max : undefined },
+        // GM 이 남기는 상태 변화는 GM 에게만 보인다 — GM 이 든 NPC·적 시트의 체력이 방 전체에
+        // 실시간으로 새어 나가면 진행이 무너진다. 알리고 싶은 수치는 GM 이 직접 말하면 된다.
+        secret: sender.role === 'GM' || undefined,
+        // 이 종류를 모르는 구버전 프로그램에서도 읽히게 평문을 함께 싣는다(빈 줄로 뜨는 것 방지).
+        // 덤으로 채팅 검색에도 걸린다(검색은 text 만 본다).
+        text: `${label} ${from} → ${to} (${diff > 0 ? '+' : ''}${diff})`
+      }
+      store.addMessage(roomId, message)
+      // 비밀이면 당사자·GM 개인 룸으로만(히스토리 필터 canSeeMessage 와 같은 집합).
+      for (const target of messageAudience(room, message)) io.to(target).emit('chat:new', message)
+    })
+
     // ===== GM 선택지 게시 — 옵션 스크립트는 서버만 보관(비공개), 라벨만 방 전체에 브로드캐스트(히스토리 저장). =====
     socket.on('chat:choice', (req) => {
       const roomId = gmRoomId()
@@ -3646,31 +3809,50 @@ export function createRelay(opts?: {
       const sender = room.participants.get(playerId)
       if (!sender) return
       const res = store.selectChoice(roomId, req.messageId, req.optionId, playerId)
-      if (!res) return // 중복 응답·무효 옵션·만료
-      const { option } = res
-      const name = room.characters.get(playerId)?.name || sender.nick
-      // GM 비공개 통지("○○님이 [라벨] 선택").
-      const gm = [...room.participants.values()].find((p) => p.role === 'GM')
-      if (gm) {
-        const notice: ChatMessage = {
+      if (!res) {
+        // 중복 응답·무효 옵션·서버가 모르는 선택지. 지금까지는 조용히 끝나서 '눌러도 아무 일이 없다'로만
+        // 보였다 — 왜 안 되는지 누른 사람에게 알린다(히스토리에는 남기지 않는 일회성 안내).
+        io.to('user:' + playerId).emit('chat:new', {
           id: randomUUID(),
           time: Date.now(),
           channel: 'main',
           kind: 'system',
-          text: `${name}님이 「${option.label}」 선택`
-        }
-        io.to('user:' + gm.playerId).emit('chat:new', notice)
+          text: '이미 선택했거나, 서버가 더는 들고 있지 않은 선택지입니다.'
+        } satisfies ChatMessage)
+        return
       }
-      // 스크립트가 있으면 선택한 본인에게만 꾸미기 스크립트로 출력.
+      const { option } = res
+      const name = room.characters.get(playerId)?.name || sender.nick
+      // GM 비공개 통지("○○님이 [라벨] 선택").
+      // secret=true + playerId → 고른 본인과 GM 에게만 보인다(canSeeMessage). 히스토리에 저장해야
+      // GM 이 그 순간 접속 중이 아니었거나 새로고침해도 남는다 — '비공개 결과 수집'의 알맹이다.
+      const notice: ChatMessage = {
+        id: randomUUID(),
+        time: Date.now(),
+        channel: 'main',
+        kind: 'system',
+        playerId,
+        secret: true,
+        text: `${name}님이 「${option.label}」 선택`
+      }
+      store.addMessage(roomId, notice)
+      const gm = [...room.participants.values()].find((p) => p.role === 'GM')
+      if (gm && gm.playerId !== playerId) io.to('user:' + gm.playerId).emit('chat:new', notice)
+      io.to('user:' + playerId).emit('chat:new', notice)
+      // 스크립트가 있으면 선택한 본인에게만 꾸미기 스크립트로 출력(GM 은 secret 열람 권한으로 함께 본다).
       if (option.script) {
         const scriptMsg: ChatMessage = {
           id: randomUUID(),
           time: Date.now(),
           channel: 'main',
           kind: 'script',
+          playerId,
+          secret: true,
           text: option.script
         }
+        store.addMessage(roomId, scriptMsg)
         io.to('user:' + playerId).emit('chat:new', scriptMsg)
+        if (gm && gm.playerId !== playerId) io.to('user:' + gm.playerId).emit('chat:new', scriptMsg)
       }
       // 본인 버튼 잠금(고른 옵션 표시).
       io.to('user:' + playerId).emit('choice:locked', { messageId: req.messageId, optionId: req.optionId })
@@ -3687,7 +3869,8 @@ export function createRelay(opts?: {
       const text = (typeof req.text === 'string' ? req.text : '').slice(0, MAX_CHAT_CHARS)
       if (!text.trim()) return
       const msg = store.editMessage(roomId, req.id, text, playerId, sender.role === 'GM')
-      if (msg) io.to(roomId).emit('chat:edited', { id: msg.id, text })
+      // 귓속말·비밀 메시지 수정본은 원문과 같은 사람에게만 — 방 전체로 쏘면 본문이 통째로 새어 나간다.
+      if (msg) io.to(messageAudience(room, msg)).emit('chat:edited', { id: msg.id, text })
     })
 
     socket.on('chat:delete', (req) => {
@@ -3697,8 +3880,11 @@ export function createRelay(opts?: {
       if (!room) return
       const sender = room.participants.get(playerId)
       if (!sender) return
+      // 지우기 전에 대상 집합을 뽑아 둔다(삭제 후엔 메시지가 사라져 라우팅을 복원할 수 없다).
+      const before = room.messages.find((m) => m.id === req.id)
+      const audience = before ? messageAudience(room, before) : [roomId]
       const id = store.deleteMessage(roomId, req.id, sender.role === 'GM')
-      if (id) io.to(roomId).emit('chat:deleted', { id })
+      if (id) io.to(audience).emit('chat:deleted', { id })
     })
 
     // ===== 입력 중 표시 (휘발 — 저장 안 함, 발신자 제외 방 전체) =====
@@ -4113,6 +4299,22 @@ export function createRelay(opts?: {
           tokens: map.tokens.map((t) => tokenForViewer(t, p)).filter((t): t is Token => t !== null)
         })
     }
+    /**
+     * 통합 레이어 토큰 방송 — 가시성 제한이 없으면 방 전체로, 있으면 참가자별 표현으로.
+     * 맵 생성·복제·가져오기가 공유한다. 서버에서 mapIds 를 손봐 놓고 이걸 안 부르면 화면은 그대로다.
+     */
+    const emitGlobalTokens = (room: Room, roomId: string, tokens: Token[]): void => {
+      for (const t of tokens) {
+        if (tokenVisibility(t) === 'all' && !(t.statsPrivate && t.bars?.length)) {
+          io.to(roomId).emit('token:state', { mapId: GLOBAL_MAP_ID, token: t })
+        } else {
+          for (const p of room.participants.values()) {
+            const rep = tokenForViewer(t, p)
+            if (rep) io.to('user:' + p.playerId).emit('token:state', { mapId: GLOBAL_MAP_ID, token: rep })
+          }
+        }
+      }
+    }
 
     // ===== BGM (다중 동시재생, GM 전용·전원 동기화) =====
     // set=트랙 추가/로드(소스 포함 broadcast 전체 목록), control=경량 트랙 토글(재생/반복/볼륨), clear=한 트랙 또는 전체 정지.
@@ -4195,7 +4397,8 @@ export function createRelay(opts?: {
       if (targets && targets.length) io.to(targets.map((t) => 'user:' + t)).emit('room:view', { view, mapId })
       else io.to(roomId).emit('room:view', { view, mapId })
       // 전원 이동은 방의 활성 맵으로 기록 — 재입장자가 '마지막으로 있던 맵'에 착지하는 폴백 기준.
-      if (view === 'map' && mapId && !(targets && targets.length)) store.setActiveMap(roomId, mapId)
+      // 비주얼 노벨로 보낼 때도 장면(맵)은 같이 바뀌므로 함께 기록한다(안 하면 재입장자만 옛 장면에 착지).
+      if (mapId && !(targets && targets.length)) store.setActiveMap(roomId, mapId)
     })
 
     // 각 클라가 현재 보는 맵/뷰를 보고 — 서버는 위치를 저장하고 GM 들에게 집계(room:positions) 전달.
@@ -4299,17 +4502,28 @@ export function createRelay(opts?: {
     socket.on('map:create', (req) => {
       const roomId = gmRoomId()
       if (!roomId) return
-      const map = store.createMap(roomId, typeof req?.name === 'string' ? req.name : undefined)
-      if (map) io.to(roomId).emit('map:added', map)
+      const res = store.createMap(
+        roomId,
+        typeof req?.name === 'string' ? req.name : undefined,
+        typeof req?.baseMapId === 'string' ? req.baseMapId : undefined
+      )
+      const room = store.getRoom(roomId)
+      if (!res || !room) return
+      io.to(roomId).emit('map:added', res.map)
+      // 새 맵에 이어붙은 통합 레이어를 실제로 내려보낸다 — 이게 없으면 서버만 고쳐지고 화면은 그대로다
+      // (지금까지 복제 맵이 정확히 그 상태였다: 다시 들어와야 보였다).
+      emitGlobalTokens(room, roomId, res.touchedGlobals)
     })
 
     // 맵세트 복제(GM 전용) — 서버가 새 맵을 만들어 전원에 map:added.
     socket.on('map:duplicate', (req) => {
       const roomId = gmRoomId()
       if (!roomId || !req || typeof req.mapId !== 'string') return
-      const map = store.duplicateMap(roomId, req.mapId)
+      const res = store.duplicateMap(roomId, req.mapId)
       const room = store.getRoom(roomId)
-      if (map && room) broadcastMapAdded(room, roomId, map)
+      if (!res || !room) return
+      broadcastMapAdded(room, roomId, res.map)
+      emitGlobalTokens(room, roomId, res.touchedGlobals)
     })
 
     // 맵세트 일괄 가져오기(GM 전용) — 외부 파일 변환 맵들을 정규화·생성해 각각 map:added.
@@ -4353,17 +4567,7 @@ export function createRelay(opts?: {
         globalsRaw,
         created.length ? created.map((m) => m.id) : undefined
       )
-      if (room)
-        for (const t of globals) {
-          if (tokenVisibility(t) === 'all' && !(t.statsPrivate && t.bars?.length)) {
-            io.to(roomId).emit('token:state', { mapId: GLOBAL_MAP_ID, token: t })
-          } else {
-            for (const p of room.participants.values()) {
-              const rep = tokenForViewer(t, p)
-              if (rep) io.to('user:' + p.playerId).emit('token:state', { mapId: GLOBAL_MAP_ID, token: rep })
-            }
-          }
-        }
+      if (room) emitGlobalTokens(room, roomId, globals)
     })
 
     // ===== 저장 슬롯 (GM 전용) — 현재 반면을 이름 붙여 저장 / 로드(전원 재싱크) / 삭제 =====
